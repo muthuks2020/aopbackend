@@ -11,11 +11,17 @@ const { testConnection } = require('./config/database');
 const { auditMiddleware } = require('./middleware/audit');
 const errorHandler = require('./middleware/errorHandler');
 
-
+// Route imports
 const authRoutes = require('./routes/auth.routes');
 const commonRoutes = require('./routes/common.routes');
 const salesrepRoutes = require('./routes/salesrep.routes');
 const tbmRoutes = require('./routes/tbm.routes');
+const specialistRoutes = require('./routes/specialist.routes');
+const abmSpecialistRoutes = require('./routes/abmSpecialist.routes');
+
+// Middleware imports for inline auth on ABM specialist routes
+const authenticate = require('./middleware/authenticate');
+const authorize = require('./middleware/authorize');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -73,10 +79,19 @@ app.get('/health', (req, res) => {
 });
 
 
+// ========== API ROUTES ==========
 app.use(`${API_PREFIX}/auth`, authRoutes);
 app.use(API_PREFIX, commonRoutes);
 app.use(API_PREFIX, salesrepRoutes);
 app.use(`${API_PREFIX}/tbm`, tbmRoutes);
+app.use(`${API_PREFIX}/specialist`, specialistRoutes);
+app.use(`${API_PREFIX}/abm`, authenticate, authorize('abm'), abmSpecialistRoutes);
+
+// Future route stubs (uncomment when implemented)
+// app.use(`${API_PREFIX}/abm`, abmRoutes);
+// app.use(`${API_PREFIX}/zbm`, zbmRoutes);
+// app.use(`${API_PREFIX}/saleshead`, salesheadRoutes);
+// app.use(`${API_PREFIX}/admin`, adminRoutes);
 
 
 app.use((req, res) => {
