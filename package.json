@@ -4,7 +4,7 @@
   "description": "Target Setting PWA Backend API for Appasamy Associates - with Azure AD SSO",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node src/server.js",
     "dev": "nodemon server.js",
     "migrate": "knex migrate:latest",
     "seed": "knex seed:run",
