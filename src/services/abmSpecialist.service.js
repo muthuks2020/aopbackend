@@ -1,15 +1,9 @@
 /**
  * ABM Specialist Service
  * Business logic for ABM managing specialist submissions and yearly targets.
- *
  * Chain: Specialist → ABM (review/approve) → ZBM → Sales Head
  *
- * Tables used:
- *  - product_commitments       (specialist submissions)
- *  - commitment_approvals      (immutable audit trail)
- *  - yearly_target_assignments (top-down yearly targets)
- *  - auth_users                (specialist lookup)
- *  - audit_log                 (action logging)
+ * @version 2.0.0 - Migrated to aop schema (v5)
  */
 
 'use strict';
@@ -22,30 +16,30 @@ const { SPECIALIST_ROLES } = require('../utils/specialistConstants');
 // ──────────────────────────────────────────────────────────────────
 
 const getActiveFY = async () => {
-  const fy = await db('fiscal_years').where({ is_active: true }).first();
+  const fy = await db('ts_fiscal_years').where({ is_active: true }).first();
   return fy?.code || 'FY26_27';
 };
 
-/** Get employee_codes of all active specialists under an ABM */
 const getSpecialistCodes = async (abmEmployeeCode) => {
-  const rows = await db('auth_users')
+  const rows = await db('ts_auth_users')
     .where({ reports_to: abmEmployeeCode, is_active: true })
     .whereIn('role', SPECIALIST_ROLES)
     .select('employee_code');
   return rows.map((r) => r.employee_code);
 };
 
-/** Format a product_commitments row for ABM review */
+/** Format a ts_product_commitments row for ABM review (with JOINed fields) */
 const formatSubmission = (r) => ({
   id: r.id,
   fiscalYearCode: r.fiscal_year_code,
   employeeCode: r.employee_code,
-  employeeName: r.employee_name,
-  employeeRole: r.employee_role,
+  employeeName: r.employee_name || r.full_name || null,
+  employeeRole: r.employee_role || r.role || null,
   productCode: r.product_code,
-  productName: r.product_name,
-  categoryId: r.category_id,
-  unit: r.unit,
+  productName: r.product_name || null,
+  categoryId: r.category_id || r.product_category || null,
+  unit: r.unit || null,
+  unitCost: r.unit_cost ? parseFloat(r.unit_cost) : null,
   zoneName: r.zone_name,
   areaName: r.area_name,
   territoryName: r.territory_name,
@@ -54,22 +48,29 @@ const formatSubmission = (r) => ({
   submittedAt: r.submitted_at,
   approvedAt: r.approved_at,
   approvedByCode: r.approved_by_code,
-  approvedByName: r.approved_by_name,
+  approvedByCode: r.approved_by_code,
 });
 
 // ======================================================================
-// GET /abm/specialist-submissions
+// GET /abm/specialist-submissions — with product_master JOIN
 // ======================================================================
 const getSpecialistSubmissions = async (abmEmployeeCode, fiscalYearCode) => {
   const fy = fiscalYearCode || await getActiveFY();
   const specialistCodes = await getSpecialistCodes(abmEmployeeCode);
   if (specialistCodes.length === 0) return [];
 
-  const rows = await db('product_commitments')
-    .whereIn('employee_code', specialistCodes)
-    .where({ fiscal_year_code: fy })
-    .whereIn('status', ['submitted', 'approved'])
-    .orderBy('submitted_at', 'desc');
+  const rows = await db('ts_product_commitments AS pc')
+    .join('product_master AS pm', 'pm.productcode', 'pc.product_code')
+    .leftJoin('ts_auth_users AS u', 'u.employee_code', 'pc.employee_code')
+    .whereIn('pc.employee_code', specialistCodes)
+    .where({ 'pc.fiscal_year_code': fy })
+    .whereIn('pc.status', ['submitted', 'approved'])
+    .select(
+      'pc.*',
+      'pm.product_name', 'pm.product_category', 'pm.quota_price__c AS unit_cost',
+      'u.full_name AS employee_name', 'u.role AS employee_role'
+    )
+    .orderBy('pc.submitted_at', 'desc');
 
   return rows.map(formatSubmission);
 };
@@ -78,73 +79,59 @@ const getSpecialistSubmissions = async (abmEmployeeCode, fiscalYearCode) => {
 // PUT /abm/approve-specialist/:id
 // ======================================================================
 const approveSpecialist = async (commitmentId, abmUser, corrections, comments) => {
-  const commitment = await db('product_commitments').where({ id: commitmentId }).first();
-
+  const commitment = await db('ts_product_commitments').where({ id: commitmentId }).first();
   if (!commitment) {
     const err = new Error('Commitment not found');
     err.status = 404;
     throw err;
   }
+  if (commitment.status !== 'submitted') {
+    const err = new Error(`Can only approve 'submitted'. Current: '${commitment.status}'`);
+    err.status = 400;
+    throw err;
+  }
 
-  // Verify this specialist reports to the ABM
-  const specialist = await db('auth_users')
-    .where({ employee_code: commitment.employee_code, is_active: true })
-    .first();
-
-  if (!specialist || specialist.reports_to !== abmUser.employeeCode) {
+  // Verify specialist reports to this ABM
+  const specialistCodes = await getSpecialistCodes(abmUser.employeeCode);
+  if (!specialistCodes.includes(commitment.employee_code)) {
     const err = new Error('This specialist does not report to you');
     err.status = 403;
     throw err;
   }
 
-  if (commitment.status === 'approved') {
-    const err = new Error('Already approved');
-    err.status = 400;
-    throw err;
-  }
-
-  if (commitment.status !== 'submitted') {
-    const err = new Error('Only submitted commitments can be approved');
-    err.status = 400;
-    throw err;
-  }
-
   const now = new Date();
   const hasCorrections = corrections && Object.keys(corrections).length > 0;
-  const action = hasCorrections ? 'corrected_and_approved' : 'approved';
+  let originalValues = null;
+  let action = 'approved';
 
   await db.transaction(async (trx) => {
-    let originalValues = null;
-    let updatedTargets = { ...(commitment.monthly_targets || {}) };
-
     if (hasCorrections) {
-      originalValues = {};
-      for (const [month, vals] of Object.entries(corrections)) {
-        if (updatedTargets[month]) {
-          originalValues[month] = { ...updatedTargets[month] };
-          updatedTargets[month] = { ...updatedTargets[month], ...vals };
+      originalValues = { ...(commitment.monthly_targets || {}) };
+      const updated = { ...commitment.monthly_targets };
+      for (const [month, values] of Object.entries(corrections)) {
+        if (updated[month]) {
+          updated[month] = { ...updated[month], ...values };
         }
       }
+      await trx('ts_product_commitments').where({ id: commitmentId }).update({
+        monthly_targets: JSON.stringify(updated),
+      });
+      action = 'corrected_and_approved';
     }
 
-    const updateData = {
+    await trx('ts_product_commitments').where({ id: commitmentId }).update({
       status: 'approved',
       approved_at: now,
       approved_by_code: abmUser.employeeCode,
-      approved_by_name: abmUser.fullName,
+      
       updated_at: now,
-    };
-    if (hasCorrections) {
-      updateData.monthly_targets = JSON.stringify(updatedTargets);
-    }
+    });
 
-    await trx('product_commitments').where({ id: commitmentId }).update(updateData);
-
-    await trx('commitment_approvals').insert({
+    await trx('ts_commitment_approvals').insert({
       commitment_id: commitmentId,
       action,
       actor_code: abmUser.employeeCode,
-      actor_name: abmUser.fullName,
+      
       actor_role: abmUser.role,
       corrections: hasCorrections ? JSON.stringify(corrections) : null,
       original_values: originalValues ? JSON.stringify(originalValues) : null,
@@ -152,7 +139,7 @@ const approveSpecialist = async (commitmentId, abmUser, corrections, comments) =
       created_at: now,
     });
 
-    await trx('audit_log').insert({
+    await trx('ts_audit_log').insert({
       actor_code: abmUser.employeeCode,
       actor_role: abmUser.role,
       action: `specialist_${action}`,
@@ -176,7 +163,7 @@ const approveSpecialist = async (commitmentId, abmUser, corrections, comments) =
 const bulkApproveSpecialist = async (submissionIds, abmUser) => {
   const specialistCodes = await getSpecialistCodes(abmUser.employeeCode);
 
-  const eligible = await db('product_commitments')
+  const eligible = await db('ts_product_commitments')
     .whereIn('id', submissionIds)
     .whereIn('employee_code', specialistCodes)
     .where({ status: 'submitted' });
@@ -191,13 +178,13 @@ const bulkApproveSpecialist = async (submissionIds, abmUser) => {
   const now = new Date();
 
   await db.transaction(async (trx) => {
-    await trx('product_commitments')
+    await trx('ts_product_commitments')
       .whereIn('id', ids)
       .update({
         status: 'approved',
         approved_at: now,
         approved_by_code: abmUser.employeeCode,
-        approved_by_name: abmUser.fullName,
+        
         updated_at: now,
       });
 
@@ -205,13 +192,13 @@ const bulkApproveSpecialist = async (submissionIds, abmUser) => {
       commitment_id: id,
       action: 'bulk_approved',
       actor_code: abmUser.employeeCode,
-      actor_name: abmUser.fullName,
+      
       actor_role: abmUser.role,
       created_at: now,
     }));
-    await trx('commitment_approvals').insert(approvalRows);
+    await trx('ts_commitment_approvals').insert(approvalRows);
 
-    await trx('audit_log').insert({
+    await trx('ts_audit_log').insert({
       actor_code: abmUser.employeeCode,
       actor_role: abmUser.role,
       action: 'specialist_bulk_approved',
@@ -228,7 +215,7 @@ const bulkApproveSpecialist = async (submissionIds, abmUser) => {
 // GET /abm/specialists
 // ======================================================================
 const getSpecialists = async (abmEmployeeCode) => {
-  const rows = await db('auth_users')
+  const rows = await db('ts_auth_users')
     .where({ reports_to: abmEmployeeCode, is_active: true })
     .whereIn('role', SPECIALIST_ROLES)
     .orderBy('full_name');
@@ -243,16 +230,17 @@ const getSpecialists = async (abmEmployeeCode) => {
     zoneName: r.zone_name,
     areaName: r.area_name,
     territoryName: r.territory_name,
+    isVacant: r.is_vacant || false,
   }));
 };
 
 // ======================================================================
-// GET /abm/specialist-yearly-targets?fy=
+// GET /abm/specialist-yearly-targets
 // ======================================================================
 const getSpecialistYearlyTargets = async (abmEmployeeCode, fiscalYearCode) => {
   const fy = fiscalYearCode || await getActiveFY();
 
-  const rows = await db('yearly_target_assignments')
+  const rows = await db('ts_yearly_target_assignments')
     .where({ manager_code: abmEmployeeCode, fiscal_year_code: fy })
     .whereIn('assignee_role', SPECIALIST_ROLES)
     .orderBy('assignee_name');
@@ -264,12 +252,12 @@ const getSpecialistYearlyTargets = async (abmEmployeeCode, fiscalYearCode) => {
     assigneeName: r.assignee_name,
     assigneeRole: r.assignee_role,
     assigneeTerritory: r.assignee_territory,
-    lyTargetQty: parseFloat(r.ly_target_qty) || 0,
-    lyAchievedQty: parseFloat(r.ly_achieved_qty) || 0,
-    lyTargetValue: parseFloat(r.ly_target_value) || 0,
-    lyAchievedValue: parseFloat(r.ly_achieved_value) || 0,
-    cyTargetQty: parseFloat(r.cy_target_qty) || 0,
-    cyTargetValue: parseFloat(r.cy_target_value) || 0,
+    lyTargetQty: parseFloat(r.ly_target_qty || 0),
+    lyAchievedQty: parseFloat(r.ly_achieved_qty || 0),
+    lyTargetValue: parseFloat(r.ly_target_value || 0),
+    lyAchievedValue: parseFloat(r.ly_achieved_value || 0),
+    cyTargetQty: parseFloat(r.cy_target_qty || 0),
+    cyTargetValue: parseFloat(r.cy_target_value || 0),
     categoryBreakdown: r.category_breakdown || [],
     status: r.status,
     publishedAt: r.published_at,
@@ -285,30 +273,25 @@ const saveSpecialistYearlyTargets = async (targets, abmUser, fiscalYearCode) => 
 
   await db.transaction(async (trx) => {
     for (const t of targets) {
-      const existing = await trx('yearly_target_assignments')
-        .where({
-          fiscal_year_code: fy,
-          manager_code: abmUser.employeeCode,
-          assignee_code: t.assigneeCode,
-        })
-        .first();
+      const existing = await trx('ts_yearly_target_assignments').where({
+        fiscal_year_code: fy,
+        manager_code: abmUser.employeeCode,
+        assignee_code: t.assigneeCode,
+      }).first();
 
       const data = {
-        cy_target_value: t.cyTargetValue || 0,
         cy_target_qty: t.cyTargetQty || 0,
-        category_breakdown: JSON.stringify(t.categoryBreakdown || []),
+        cy_target_value: t.cyTargetValue || 0,
+        category_breakdown: t.categoryBreakdown ? JSON.stringify(t.categoryBreakdown) : '[]',
         status: 'draft',
         updated_at: now,
       };
 
       if (existing) {
-        await trx('yearly_target_assignments').where({ id: existing.id }).update(data);
+        await trx('ts_yearly_target_assignments').where({ id: existing.id }).update(data);
       } else {
-        const specialist = await trx('auth_users')
-          .where({ employee_code: t.assigneeCode, is_active: true })
-          .first();
-
-        await trx('yearly_target_assignments').insert({
+        const specialist = await trx('ts_auth_users').where({ employee_code: t.assigneeCode }).first();
+        await trx('ts_yearly_target_assignments').insert({
           fiscal_year_code: fy,
           manager_code: abmUser.employeeCode,
           manager_role: abmUser.role,
@@ -316,10 +299,6 @@ const saveSpecialistYearlyTargets = async (targets, abmUser, fiscalYearCode) => 
           assignee_name: t.assigneeName || specialist?.full_name || '',
           assignee_role: specialist?.role || 'at_iol_specialist',
           assignee_territory: specialist?.area_name || specialist?.territory_name || '',
-          ly_target_qty: t.lyTargetQty || 0,
-          ly_achieved_qty: t.lyAchievedQty || 0,
-          ly_target_value: t.lyTargetValue || 0,
-          ly_achieved_value: t.lyAchievedValue || 0,
           ...data,
           created_at: now,
         });
@@ -334,19 +313,18 @@ const saveSpecialistYearlyTargets = async (targets, abmUser, fiscalYearCode) => 
 // POST /abm/specialist-yearly-targets/publish
 // ======================================================================
 const publishSpecialistYearlyTargets = async (targets, abmUser, fiscalYearCode) => {
-  // Save first, then flip status
   await saveSpecialistYearlyTargets(targets, abmUser, fiscalYearCode);
 
   const fy = fiscalYearCode || await getActiveFY();
   const now = new Date();
   const assigneeCodes = targets.map((t) => t.assigneeCode);
 
-  await db('yearly_target_assignments')
+  await db('ts_yearly_target_assignments')
     .where({ manager_code: abmUser.employeeCode, fiscal_year_code: fy })
     .whereIn('assignee_code', assigneeCodes)
     .update({ status: 'published', published_at: now, updated_at: now });
 
-  await db('audit_log').insert({
+  await db('ts_audit_log').insert({
     actor_code: abmUser.employeeCode,
     actor_role: abmUser.role,
     action: 'specialist_yearly_targets_published',
@@ -365,54 +343,46 @@ const getSpecialistDashboardStats = async (abmEmployeeCode, fiscalYearCode) => {
   const fy = fiscalYearCode || await getActiveFY();
   const specialistCodes = await getSpecialistCodes(abmEmployeeCode);
 
-  if (specialistCodes.length === 0) {
-    return {
-      specialistCount: 0,
-      submissions: { total: 0, pending: 0, approved: 0 },
-      yearlyTargets: { total: 0, published: 0, notSet: 0 },
-    };
-  }
-
-  const submissions = await db('product_commitments')
-    .whereIn('employee_code', specialistCodes)
-    .where({ fiscal_year_code: fy })
-    .select(
-      db.raw("COUNT(*) as total"),
-      db.raw("COUNT(*) FILTER (WHERE status = 'submitted') as pending"),
-      db.raw("COUNT(*) FILTER (WHERE status = 'approved') as approved")
-    )
-    .first();
-
-  const yearlyStats = await db('yearly_target_assignments')
-    .where({ manager_code: abmEmployeeCode, fiscal_year_code: fy })
-    .whereIn('assignee_role', SPECIALIST_ROLES)
-    .select(
-      db.raw("COUNT(*) as total"),
-      db.raw("COUNT(*) FILTER (WHERE status = 'published') as published"),
-      db.raw("COUNT(*) FILTER (WHERE status = 'not_set') as not_set")
-    )
-    .first();
+  const submissions = specialistCodes.length > 0
+    ? await db('ts_product_commitments')
+        .whereIn('employee_code', specialistCodes)
+        .where({ fiscal_year_code: fy })
+    : [];
 
   return {
-    specialistCount: specialistCodes.length,
-    submissions: {
-      total: parseInt(submissions?.total) || 0,
-      pending: parseInt(submissions?.pending) || 0,
-      approved: parseInt(submissions?.approved) || 0,
-    },
-    yearlyTargets: {
-      total: parseInt(yearlyStats?.total) || 0,
-      published: parseInt(yearlyStats?.published) || 0,
-      notSet: parseInt(yearlyStats?.not_set) || 0,
-    },
+    totalSpecialists: specialistCodes.length,
+    totalSubmissions: submissions.length,
+    pending: submissions.filter((s) => s.status === 'submitted').length,
+    approved: submissions.filter((s) => s.status === 'approved').length,
+    draft: submissions.filter((s) => s.status === 'draft').length,
   };
+};
+
+const rejectSpecialist = async (commitmentId, abmUser, reason = '') => {
+  const commitment = await db('ts_product_commitments').where({ id: commitmentId }).first();
+  if (!commitment) throw Object.assign(new Error('Commitment not found'), { status: 404 });
+  if (commitment.status !== 'submitted') throw Object.assign(new Error('Only submitted commitments can be rejected'), { status: 400 });
+  const specialist = await db('ts_auth_users').where({ employee_code: commitment.employee_code, is_active: true }).first();
+  if (!specialist || specialist.reports_to !== abmUser.employeeCode) throw Object.assign(new Error('This specialist does not report to you'), { status: 403 });
+  await db('ts_product_commitments').where({ id: commitmentId }).update({ status: 'draft', updated_at: new Date() });
+  await db('ts_commitment_approvals').insert({ commitment_id: commitmentId, action: 'rejected', actor_code: abmUser.employeeCode, actor_role: abmUser.role, comments: reason });
+  return { success: true };
+};
+
+const getUniqueSpecialists = async (abmEmployeeCode) => {
+  const specialistCodes = await getSpecialistCodes(abmEmployeeCode);
+  const specialists = await db('ts_auth_users').whereIn('employee_code', specialistCodes).where('is_active', true)
+    .select('employee_code', 'full_name', 'designation', 'role', 'territory_name');
+  return specialists.map((s) => ({ employeeCode: s.employee_code, fullName: s.full_name, designation: s.designation, role: s.role, territory: s.territory_name }));
 };
 
 module.exports = {
   getSpecialistSubmissions,
   approveSpecialist,
+  rejectSpecialist,
   bulkApproveSpecialist,
   getSpecialists,
+  getUniqueSpecialists,
   getSpecialistYearlyTargets,
   saveSpecialistYearlyTargets,
   publishSpecialistYearlyTargets,

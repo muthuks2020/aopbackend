@@ -1,14 +1,7 @@
 /**
  * auth.controller.js — Authentication Controller
  * 
- * Handles:
- * - POST /auth/login        → Local username/password login
- * - POST /auth/sso-login    → Azure AD SSO login (NEW)
- * - POST /auth/logout       → Revoke session
- * - POST /auth/refresh      → Refresh JWT token
- * - GET  /auth/me           → Current user profile
- * 
- * @version 2.0.0 - Added SSO login
+ * @version 3.0.0 - Migrated to aop schema (v5). Added specialist role labels.
  * @author Appasamy Associates - Target Setting PWA
  */
 
@@ -30,11 +23,17 @@ const ROLE_LABELS = {
   zbm: 'Zonal Business Manager',
   sales_head: 'Sales Head',
   admin: 'System Administrator',
+  at_iol_specialist: 'AT/IOL Specialist',
+  eq_spec_diagnostic: 'Equipment Specialist (Diagnostic)',
+  eq_spec_surgical: 'Equipment Specialist (Surgical)',
+  at_iol_manager: 'AT/IOL Manager',
+  eq_mgr_diagnostic: 'Equipment Manager (Diagnostic)',
+  eq_mgr_surgical: 'Equipment Manager (Surgical)',
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // POST /auth/login — Local credential login
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 async function login(req, res) {
   try {
     const { username, password } = req.body;
@@ -48,8 +47,7 @@ async function login(req, res) {
 
     const knex = db.getKnex();
 
-    // Find user by username
-    const user = await knex('target_setting.auth_users')
+    const user = await knex('ts_auth_users')
       .where('username', username)
       .andWhere('is_active', true)
       .first();
@@ -61,7 +59,6 @@ async function login(req, res) {
       });
     }
 
-    // Check if user can login locally
     if (user.auth_provider === 'azure_ad') {
       return res.status(401).json({
         success: false,
@@ -69,7 +66,6 @@ async function login(req, res) {
       });
     }
 
-    // Verify password
     if (!user.password_hash) {
       return res.status(401).json({
         success: false,
@@ -85,7 +81,6 @@ async function login(req, res) {
       });
     }
 
-    // Generate JWT + session
     const tokenData = await createSessionAndToken(knex, user, 'local', req);
 
     return res.json({
@@ -101,12 +96,11 @@ async function login(req, res) {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /auth/sso-login — Azure AD SSO login (NEW)
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// POST /auth/sso-login — Azure AD SSO login
+// ═══════════════════════════════════════════════════════════════════
 async function ssoLogin(req, res) {
   try {
-    // Check if SSO is enabled
     if (!azureConfig.SSO_ENABLED) {
       return res.status(403).json({
         success: false,
@@ -123,7 +117,6 @@ async function ssoLogin(req, res) {
       });
     }
 
-    // ── Step 1: Validate the Azure AD token ─────────────────────────────
     let claims;
     try {
       claims = await ssoService.validateAzureToken(azure_token);
@@ -135,7 +128,6 @@ async function ssoLogin(req, res) {
       });
     }
 
-    // Extract data from validated claims (prefer claims over request body)
     const validatedEmail = (claims.preferred_username || claims.email || email || '').toLowerCase();
     const validatedName = claims.name || name || validatedEmail.split('@')[0];
     const validatedOid = claims.oid || claims.sub || azure_oid || '';
@@ -148,7 +140,6 @@ async function ssoLogin(req, res) {
       });
     }
 
-    // ── Step 2: Find or create user ─────────────────────────────────────
     const knex = db.getKnex();
     const user = await ssoService.findOrCreateSsoUser({
       azure_oid: validatedOid,
@@ -164,7 +155,6 @@ async function ssoLogin(req, res) {
       });
     }
 
-    // ── Step 3: Generate app JWT + session ───────────────────────────────
     const tokenData = await createSessionAndToken(knex, user, 'azure_ad', req);
 
     return res.json({
@@ -172,92 +162,92 @@ async function ssoLogin(req, res) {
       ...tokenData,
     });
   } catch (error) {
-    console.error('[Auth] SSO login error:', error);
+    console.error('[Auth] SSO Login error:', error);
     return res.status(500).json({
       success: false,
-      message: 'SSO login failed. Please try again.',
+      message: 'Internal server error',
     });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /auth/logout — Revoke session
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// POST /auth/logout
+// ═══════════════════════════════════════════════════════════════════
 async function logout(req, res) {
   try {
     const knex = db.getKnex();
-    const tokenJti = req.user?.jti;
 
-    if (tokenJti) {
-      await knex('target_setting.user_sessions')
-        .where('token_jti', tokenJti)
+    if (req.user?.jti) {
+      await knex('ts_user_sessions')
+        .where('token_jti', req.user.jti)
         .update({ revoked_at: knex.fn.now() });
     }
 
     return res.json({ success: true, message: 'Logged out successfully' });
   } catch (error) {
     console.error('[Auth] Logout error:', error);
-    return res.status(500).json({ success: false, message: 'Logout failed' });
+    return res.status(500).json({ success: false, message: 'Internal server error' });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /auth/refresh — Refresh JWT token
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// POST /auth/refresh
+// ═══════════════════════════════════════════════════════════════════
 async function refresh(req, res) {
   try {
     const { refresh_token } = req.body;
 
     if (!refresh_token) {
-      return res.status(400).json({ success: false, message: 'Refresh token required' });
+      return res.status(400).json({ success: false, message: 'Refresh token is required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(refresh_token, process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret');
+    } catch {
+      return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
     }
 
     const knex = db.getKnex();
 
-    // Find active session with this refresh token
-    const session = await knex('target_setting.user_sessions')
-      .where('refresh_token', refresh_token)
+    const session = await knex('ts_user_sessions')
+      .where('token_jti', decoded.jti)
       .whereNull('revoked_at')
       .where('expires_at', '>', knex.fn.now())
       .first();
 
     if (!session) {
-      return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
+      return res.status(401).json({ success: false, message: 'Session not found or expired' });
     }
 
-    // Get user
-    const user = await knex('target_setting.auth_users')
+    // Revoke old session
+    await knex('ts_user_sessions').where('id', session.id).update({ revoked_at: knex.fn.now() });
+
+    const user = await knex('ts_auth_users')
       .where('id', session.user_id)
       .andWhere('is_active', true)
       .first();
 
     if (!user) {
-      return res.status(401).json({ success: false, message: 'User not found or deactivated' });
+      return res.status(401).json({ success: false, message: 'User not found' });
     }
 
-    // Revoke old session
-    await knex('target_setting.user_sessions')
-      .where('id', session.id)
-      .update({ revoked_at: knex.fn.now() });
-
-    // Create new session + token
-    const tokenData = await createSessionAndToken(knex, user, session.auth_method || 'local', req);
+    const tokenData = await createSessionAndToken(knex, user, user.auth_provider || 'local', req);
 
     return res.json({ success: true, ...tokenData });
   } catch (error) {
     console.error('[Auth] Refresh error:', error);
-    return res.status(500).json({ success: false, message: 'Token refresh failed' });
+    return res.status(500).json({ success: false, message: 'Internal server error' });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GET /auth/me — Current user profile
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// GET /auth/me
+// ═══════════════════════════════════════════════════════════════════
 async function me(req, res) {
   try {
     const knex = db.getKnex();
-
-    const user = await knex('target_setting.auth_users')
+    const user = await knex('ts_auth_users')
       .where('id', req.user.id)
       .andWhere('is_active', true)
       .first();
@@ -272,22 +262,22 @@ async function me(req, res) {
     });
   } catch (error) {
     console.error('[Auth] Me error:', error);
-    return res.status(500).json({ success: false, message: 'Failed to fetch profile' });
+    return res.status(500).json({ success: false, message: 'Internal server error' });
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HELPER: Create session + JWT + refresh token
-// ═══════════════════════════════════════════════════════════════════════════
-async function createSessionAndToken(knex, user, authMethod, req) {
+// ═══════════════════════════════════════════════════════════════════
+// HELPER: Create session and JWT
+// ═══════════════════════════════════════════════════════════════════
+async function createSessionAndToken(knex, user, provider, req) {
   const jti = crypto.randomUUID();
-  const refreshToken = crypto.randomBytes(64).toString('hex');
+  const refreshToken = crypto.randomBytes(48).toString('hex');
 
-  // Create JWT
   const token = jwt.sign(
     {
       id: user.id,
-      employee_code: user.employee_code,
+      userId: user.id,
+      employeeCode: user.employee_code,
       role: user.role,
       jti,
     },
@@ -295,12 +285,10 @@ async function createSessionAndToken(knex, user, authMethod, req) {
     { expiresIn: JWT_EXPIRY }
   );
 
-  // Calculate expiry
   const decoded = jwt.decode(token);
   const expiresAt = new Date(decoded.exp * 1000);
 
-  // Insert session
-  await knex('target_setting.user_sessions').insert({
+  await knex('ts_user_sessions').insert({
     user_id: user.id,
     token_jti: jti,
     refresh_token: refreshToken,
@@ -309,8 +297,7 @@ async function createSessionAndToken(knex, user, authMethod, req) {
     user_agent: req.get('User-Agent') || '',
   });
 
-  // Update last login
-  await knex('target_setting.auth_users')
+  await knex('ts_auth_users')
     .where('id', user.id)
     .update({ last_login_at: knex.fn.now() });
 
@@ -322,9 +309,9 @@ async function createSessionAndToken(knex, user, authMethod, req) {
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // HELPER: Format user object for API response
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 function formatUserResponse(user) {
   return {
     id: user.id,
@@ -345,6 +332,7 @@ function formatUserResponse(user) {
     reports_to: user.reports_to,
     auth_provider: user.auth_provider,
     azure_oid: user.azure_oid || null,
+    is_vacant: user.is_vacant || false,
   };
 }
 

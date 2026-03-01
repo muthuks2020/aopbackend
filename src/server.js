@@ -85,13 +85,8 @@ app.use(API_PREFIX, commonRoutes);
 app.use(API_PREFIX, salesrepRoutes);
 app.use(`${API_PREFIX}/tbm`, tbmRoutes);
 app.use(`${API_PREFIX}/specialist`, specialistRoutes);
-app.use(`${API_PREFIX}/abm`, authenticate, authorize('abm'), abmSpecialistRoutes);
+app.use(`${API_PREFIX}/abm`, abmSpecialistRoutes);
 
-// Future route stubs (uncomment when implemented)
-// app.use(`${API_PREFIX}/abm`, abmRoutes);
-// app.use(`${API_PREFIX}/zbm`, zbmRoutes);
-// app.use(`${API_PREFIX}/saleshead`, salesheadRoutes);
-// app.use(`${API_PREFIX}/admin`, adminRoutes);
 
 
 app.use((req, res) => {

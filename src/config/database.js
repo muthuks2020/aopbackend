@@ -1,10 +1,10 @@
 /**
  * database.js — PostgreSQL / Knex Configuration
  * 
- * Provides a singleton Knex instance configured for the target_setting schema.
- * All services import { getKnex } to run queries.
+ * Provides a singleton Knex instance configured for the aop schema.
+ * All services import { db } or getKnex() to run queries.
  * 
- * @version 1.0.0
+ * @version 2.0.0 — Migrated to unified aop schema (v5)
  * @author Appasamy Associates - Target Setting PWA
  */
 
@@ -23,7 +23,7 @@ function getKnex() {
         user: process.env.DB_USER || 'postgres',
         password: process.env.DB_PASSWORD || '',
       },
-      searchPath: [process.env.DB_SCHEMA || 'target_setting', 'public'],
+      searchPath: [process.env.DB_SCHEMA || 'aop', 'public'],
       pool: {
         min: 2,
         max: 10,
@@ -35,8 +35,8 @@ function getKnex() {
 
 async function testConnection() {
   try {
-    const knex = getKnex();
-    await knex.raw('SELECT 1');
+    const k = getKnex();
+    await k.raw('SELECT 1');
     console.log('[DB] PostgreSQL connection successful');
     return true;
   } catch (error) {
@@ -54,6 +54,7 @@ async function destroy() {
 
 module.exports = {
   getKnex,
+  db: getKnex(),
   testConnection,
   destroy,
 };

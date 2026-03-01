@@ -1,85 +1,55 @@
-/**
- * Specialist Validation Schemas
- * Joi schemas for specialist and ABM-specialist endpoints.
- * 
- * Follows same patterns as validators/schemas.js
- */
-
 'use strict';
-
+/**
+ * specialistSchemas.js — Joi schemas for specialist + ABM-specialist routes
+ * @version 2.0.0 — productCode instead of productId
+ */
 const Joi = require('joi');
 
-// ---------------------------------------------------------------------------
-// Shared sub-schemas (same JSONB shape as sales rep)
-// ---------------------------------------------------------------------------
-
-const monthlyValuesSchema = Joi.object({
-  lyQty: Joi.number().min(0).default(0),
-  cyQty: Joi.number().min(0).default(0),
-  lyRev: Joi.number().min(0).default(0),
-  cyRev: Joi.number().min(0).default(0),
-}).unknown(false);
-
-const monthlyTargetsSchema = Joi.object({
-  apr: monthlyValuesSchema, may: monthlyValuesSchema, jun: monthlyValuesSchema,
-  jul: monthlyValuesSchema, aug: monthlyValuesSchema, sep: monthlyValuesSchema,
-  oct: monthlyValuesSchema, nov: monthlyValuesSchema, dec: monthlyValuesSchema,
-  jan: monthlyValuesSchema, feb: monthlyValuesSchema, mar: monthlyValuesSchema,
-}).unknown(false);
-
-// ---------------------------------------------------------------------------
-// Specialist-side schemas
-// ---------------------------------------------------------------------------
+const monthlyTargetsSchema = Joi.object().pattern(
+  Joi.string().pattern(/^(apr|may|jun|jul|aug|sep|oct|nov|dec|jan|feb|mar)$/),
+  Joi.number().min(0)
+);
 
 const saveSpecialistProductSchema = Joi.object({
   monthlyTargets: monthlyTargetsSchema.required(),
 });
 
 const submitSpecialistMultipleSchema = Joi.object({
-  productIds: Joi.array().items(
-    Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())
-  ).min(1).required(),
+  productIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+  comments: Joi.string().allow(null, '').optional(),
 });
 
 const saveAllSpecialistProductsSchema = Joi.object({
   products: Joi.array().items(
     Joi.object({
-      id: Joi.alternatives().try(Joi.number().integer().positive(), Joi.string()).required(),
+      id: Joi.number().integer().positive().required(),
       monthlyTargets: monthlyTargetsSchema.required(),
     })
   ).min(1).required(),
 });
 
-// ---------------------------------------------------------------------------
-// ABM-side specialist schemas
-// ---------------------------------------------------------------------------
-
 const approveSpecialistSchema = Joi.object({
-  corrections: monthlyTargetsSchema.allow(null).default(null),
-  comments: Joi.string().max(1000).allow('', null).default(null),
+  corrections: Joi.object().pattern(
+    Joi.string(),
+    Joi.number().min(0)
+  ).allow(null).optional(),
+  comments: Joi.string().allow(null, '').optional(),
 });
 
 const bulkApproveSpecialistSchema = Joi.object({
-  submissionIds: Joi.array().items(
-    Joi.alternatives().try(Joi.number().integer().positive(), Joi.string())
-  ).min(1).required(),
+  submissionIds: Joi.array().items(Joi.number().integer().positive()).min(1).required(),
+  comments: Joi.string().allow(null, '').optional(),
 });
 
 const saveSpecialistYearlyTargetsSchema = Joi.object({
   targets: Joi.array().items(
     Joi.object({
-      assigneeCode: Joi.string().required(),
-      assigneeName: Joi.string().allow('', null),
-      cyTargetValue: Joi.number().min(0).default(0),
-      cyTargetQty: Joi.number().min(0).default(0),
-      lyTargetQty: Joi.number().min(0).allow(null),
-      lyAchievedQty: Joi.number().min(0).allow(null),
-      lyTargetValue: Joi.number().min(0).allow(null),
-      lyAchievedValue: Joi.number().min(0).allow(null),
-      categoryBreakdown: Joi.array().items(Joi.object().unknown(true)).default([]),
+      employeeCode: Joi.string().required(),
+      productCode: Joi.string().required(),
+      yearlyTarget: Joi.number().min(0).required(),
     })
   ).min(1).required(),
-  fiscalYear: Joi.string().pattern(/^FY\d{2}_\d{2}$/).default('FY26_27'),
+  fiscalYear: Joi.string().allow(null, '').optional(),
 });
 
 module.exports = {

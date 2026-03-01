@@ -1,3 +1,10 @@
+/**
+ * auth.js — Authentication Configuration
+ * 
+ * @version 2.0.0 - Dual-auth support (local + SSO)
+ * @author Appasamy Associates - Target Setting PWA
+ */
+
 const authConfig = {
 
   jwt: {
@@ -7,9 +14,7 @@ const authConfig = {
     refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
   },
 
-
   mode: process.env.AUTH_MODE || 'local',
-
 
   azureAd: {
     enabled: (process.env.AUTH_MODE || 'local') !== 'local',

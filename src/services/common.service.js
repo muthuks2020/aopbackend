@@ -1,11 +1,18 @@
+/**
+ * common.service.js — Shared Service (Categories, Products, Fiscal Years, Org Hierarchy)
+ * @version 2.0.0 - Migrated to aop schema (v5). Products now from aop.product_master.
+ */
+
 const { db } = require('../config/database');
 
 const CommonService = {
 
-
+  /**
+   * GET /categories — filtered by user role
+   */
   async getCategories(userRole) {
-    const rows = await db('product_categories AS c')
-      .join('role_product_access AS rpa', function () {
+    const rows = await db('ts_product_categories AS c')
+      .join('ts_role_product_access AS rpa', function () {
         this.on('rpa.category_id', '=', 'c.id').andOn('rpa.can_view', '=', db.raw('true'));
       })
       .where('rpa.role', userRole)
@@ -23,48 +30,55 @@ const CommonService = {
     }));
   },
 
-
+  /**
+   * GET /products — REWRITTEN: reads from aop.product_master (product_pricing REMOVED)
+   */
   async getProducts(categoryId) {
-    let query = db('product_pricing')
-      .where('is_active', true)
+    let query = db('product_master')
       .select(
-        'id', 'product_code', 'product_name', 'category_id', 'subcategory',
-        'unit_cost', 'currency', 'effective_from', 'effective_to', 'fiscal_year_code'
+        'productcode AS product_code',
+        'product_name',
+        'product_category AS category_id',
+        'product_family AS subcategory',
+        'quota_price__c AS unit_cost',
+        'isactive'
       )
+      .where('isactive', true)
       .orderBy('product_name');
 
     if (categoryId) {
-      query = query.where('category_id', categoryId);
+      query = query.where('product_category', categoryId);
     }
 
     const rows = await query;
     return rows.map((r) => ({
-      id: r.id,
       productCode: r.product_code,
       productName: r.product_name,
       categoryId: r.category_id,
       subcategory: r.subcategory,
-      unitCost: parseFloat(r.unit_cost),
-      currency: r.currency,
-      effectiveFrom: r.effective_from,
-      effectiveTo: r.effective_to,
-      fiscalYearCode: r.fiscal_year_code,
+      unitCost: parseFloat(r.unit_cost || 0),
+      currency: 'INR',
     }));
   },
 
-
+  /**
+   * GET /product-pricing — REWRITTEN: reads from aop.product_master
+   */
   async getProductPricing(categoryId) {
-    let query = db('product_pricing')
-      .where('is_active', true)
-      .where('effective_from', '<=', new Date())
-      .where(function () {
-        this.whereNull('effective_to').orWhere('effective_to', '>=', new Date());
-      })
-      .select('product_code', 'product_name', 'category_id', 'subcategory', 'unit_cost', 'currency')
+    let query = db('product_master')
+      .select(
+        'productcode AS product_code',
+        'product_name',
+        'product_category AS category_id',
+        'product_family AS subcategory',
+        'quota_price__c AS unit_cost'
+      )
+      .where('isactive', true)
+      .whereNotNull('quota_price__c')
       .orderBy('product_name');
 
     if (categoryId) {
-      query = query.where('category_id', categoryId);
+      query = query.where('product_category', categoryId);
     }
 
     const rows = await query;
@@ -73,14 +87,16 @@ const CommonService = {
       productName: r.product_name,
       categoryId: r.category_id,
       subcategory: r.subcategory,
-      unitCost: parseFloat(r.unit_cost),
-      currency: r.currency,
+      unitCost: parseFloat(r.unit_cost || 0),
+      currency: 'INR',
     }));
   },
 
-
+  /**
+   * GET /fiscal-years
+   */
   async getFiscalYears() {
-    const rows = await db('fiscal_years')
+    const rows = await db('ts_fiscal_years')
       .select('id', 'code', 'label', 'start_date', 'end_date', 'is_active', 'is_commitment_open', 'commitment_deadline')
       .orderBy('start_date', 'desc');
 
@@ -96,17 +112,11 @@ const CommonService = {
     }));
   },
 
-
+  /**
+   * GET /aop-targets — already uses aop.employee_product_targets (no change)
+   */
   async getAopTargets(userId, fiscalYear) {
     try {
-
-      const schemaCheck = await db.raw(
-        `SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'aop'`
-      );
-      if (schemaCheck.rows.length === 0) {
-        return [];
-      }
-
       const rows = await db.raw(
         `SELECT product_code, monthly_targets FROM aop.employee_product_targets
          WHERE employee_code = ? AND fiscal_year = ?`,
@@ -118,10 +128,11 @@ const CommonService = {
     }
   },
 
-
+  /**
+   * GET /org-hierarchy — from ts_v_org_hierarchy view
+   */
   async getOrgHierarchy() {
-    const rows = await db('v_org_hierarchy')
-      .select('*');
+    const rows = await db('ts_v_org_hierarchy').select('*');
 
     return rows.map((r) => ({
       id: r.id,
@@ -142,9 +153,11 @@ const CommonService = {
     }));
   },
 
-
+  /**
+   * Get active fiscal year
+   */
   async getActiveFiscalYear() {
-    return db('fiscal_years').where('is_active', true).first();
+    return db('ts_fiscal_years').where('is_active', true).first();
   },
 };
 

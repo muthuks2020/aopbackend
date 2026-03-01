@@ -1,18 +1,9 @@
 /**
  * authenticate.js — Dual-Auth Middleware
  * 
- * Verifies the app JWT (issued by our auth controller) on protected routes.
- * This middleware does NOT validate Azure AD tokens directly — that happens
- * only in the /auth/sso-login endpoint. Once a user logs in (local or SSO),
- * they receive an app JWT which this middleware validates.
+ * Verifies the app JWT on protected routes.
  * 
- * Flow:
- * 1. Extract Bearer token from Authorization header
- * 2. Verify JWT signature and expiry
- * 3. Check session is not revoked in user_sessions
- * 4. Attach user to req.user
- * 
- * @version 2.0.0 - Dual-auth support (local + SSO users use same app JWT)
+ * @version 3.0.0 - Migrated to aop.ts_* schema (v5)
  * @author Appasamy Associates - Target Setting PWA
  */
 
@@ -23,14 +14,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'appasamy-target-setting-jwt-secret
 
 /**
  * Main authentication middleware.
- * All protected routes use this — works identically for local and SSO users
- * because both receive the same app JWT format from /auth/login or /auth/sso-login.
  */
 async function authenticate(req, res, next) {
   try {
     // ── Step 1: Extract token ───────────────────────────────────────────
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         success: false,
@@ -67,9 +56,9 @@ async function authenticate(req, res, next) {
 
     // ── Step 3: Check session is not revoked ────────────────────────────
     const knex = db.getKnex();
-    
+
     if (decoded.jti) {
-      const session = await knex('target_setting.user_sessions')
+      const session = await knex('ts_user_sessions')
         .where('token_jti', decoded.jti)
         .whereNull('revoked_at')
         .where('expires_at', '>', knex.fn.now())
@@ -85,8 +74,8 @@ async function authenticate(req, res, next) {
     }
 
     // ── Step 4: Fetch user and verify active ────────────────────────────
-    const user = await knex('target_setting.auth_users')
-      .where('id', decoded.id)
+    const user = await knex('ts_auth_users')
+      .where('id', decoded.id || decoded.userId)
       .andWhere('is_active', true)
       .first();
 
@@ -100,9 +89,11 @@ async function authenticate(req, res, next) {
     // ── Step 5: Attach user to request ──────────────────────────────────
     req.user = {
       id: user.id,
+      employeeCode: user.employee_code,
       employee_code: user.employee_code,
       username: user.username,
       name: user.full_name,
+      fullName: user.full_name,
       email: user.email,
       role: user.role,
       designation: user.designation,
@@ -114,6 +105,7 @@ async function authenticate(req, res, next) {
       territory_name: user.territory_name,
       reports_to: user.reports_to,
       auth_provider: user.auth_provider,
+      isVacant: user.is_vacant || false,
       jti: decoded.jti,
     };
 
@@ -128,24 +120,22 @@ async function authenticate(req, res, next) {
 }
 
 /**
- * Optional auth middleware — attaches user if token present, but doesn't block.
- * Useful for endpoints that behave differently for authenticated vs anonymous.
+ * Optional auth middleware — attaches user if token present, doesn't block.
  */
 async function optionalAuth(req, res, next) {
   const authHeader = req.headers.authorization;
-  
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     req.user = null;
     return next();
   }
 
-  // Try to authenticate, but don't fail if it doesn't work
   try {
     await authenticate(req, res, () => {});
   } catch {
     req.user = null;
   }
-  
+
   next();
 }
 

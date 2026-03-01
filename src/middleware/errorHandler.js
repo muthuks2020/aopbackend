@@ -1,36 +1,27 @@
-const { errorResponse } = require('../utils/helpers');
+'use strict';
+/**
+ * errorHandler.js — Global error handler
+ * @version 2.0.0
+ */
+const logger = console;
 
+const errorHandler = (err, req, res, _next) => {
+  const status = err.status || err.statusCode || 500;
+  const message = err.message || 'Internal Server Error';
 
-const errorHandler = (err, req, res, next) => {
-  console.error('🔴 Error:', err);
-
-
-  if (err.isJoi) {
-    return res.status(400).json(errorResponse('Validation error.', err.details?.map((d) => d.message)));
+  if (status >= 500) {
+    logger.error(`[ERROR] ${req.method} ${req.originalUrl}`, {
+      status,
+      message: err.message,
+      stack: process.env.NODE_ENV !== 'production' ? err.stack : undefined,
+    });
   }
 
-
-  if (err.status) {
-    return res.status(err.status).json(errorResponse(err.message));
-  }
-
-
-  if (err.code) {
-    switch (err.code) {
-      case '23505':
-        return res.status(409).json(errorResponse('Duplicate entry. This record already exists.'));
-      case '23503':
-        return res.status(400).json(errorResponse('Referenced record not found.'));
-      case '23502':
-        return res.status(400).json(errorResponse(`Missing required field: ${err.column}`));
-      default:
-        break;
-    }
-  }
-
-
-  const message = process.env.NODE_ENV === 'production' ? 'Internal server error.' : err.message;
-  return res.status(500).json(errorResponse(message));
+  res.status(status).json({
+    success: false,
+    message,
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack }),
+  });
 };
 
 module.exports = errorHandler;

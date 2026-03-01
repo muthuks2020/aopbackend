@@ -1,12 +1,6 @@
 /**
- * Specialist Role Constants
- * Shared across specialist routes, controllers, and services.
- *
- * DB enum user_role includes:
- *   at_iol_specialist, eq_spec_diagnostic, eq_spec_surgical   (specialist)
- *   at_iol_manager, eq_mgr_diagnostic, eq_mgr_surgical        (specialist managers)
- *
- * Reporting chain: Specialist → ABM → ZBM → Sales Head
+ * specialistConstants.js — Constants for Specialist features
+ * @version 1.0.0
  */
 
 'use strict';
@@ -32,12 +26,9 @@ const QUARTERS = {
   Q4: ['jan', 'feb', 'mar'],
 };
 
-const isSpecialistRole = (role) => SPECIALIST_ROLES.includes(role);
-
 module.exports = {
   SPECIALIST_ROLES,
   SPECIALIST_MANAGER_ROLES,
   FISCAL_MONTHS,
   QUARTERS,
-  isSpecialistRole,
 };

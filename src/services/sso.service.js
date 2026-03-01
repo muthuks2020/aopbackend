@@ -1,15 +1,6 @@
 /**
  * sso.service.js — Azure AD SSO Backend Service
- * 
- * Handles:
- * 1. Azure AD ID token validation (via JWKS)
- * 2. User lookup by azure_oid in auth_users
- * 3. Auto-provisioning: create new user on first SSO login
- * 4. Role assignment: default admin emails → admin, others → configurable default
- * 5. Azure AD group → role mapping (when group claims available)
- * 
- * @version 1.0.0
- * @author Appasamy Associates - Target Setting PWA
+ * @version 2.0.0 - Migrated to aop schema (v5)
  */
 
 const jwt = require('jsonwebtoken');
@@ -17,7 +8,6 @@ const jwksClient = require('jwks-rsa');
 const azureConfig = require('../config/azure-ad');
 const db = require('../config/database');
 
-// ─── JWKS client for Azure AD public key retrieval ──────────────────────────
 let jwksClientInstance = null;
 
 function getJwksClient() {
@@ -26,15 +16,12 @@ function getJwksClient() {
       jwksUri: azureConfig.JWKS_URI,
       cache: true,
       cacheMaxEntries: 5,
-      cacheMaxAge: 600000, // 10 minutes
+      cacheMaxAge: 600000,
     });
   }
   return jwksClientInstance;
 }
 
-/**
- * Get signing key from Azure AD JWKS endpoint.
- */
 function getSigningKey(header) {
   return new Promise((resolve, reject) => {
     getJwksClient().getSigningKey(header.kid, (err, key) => {
@@ -44,28 +31,14 @@ function getSigningKey(header) {
   });
 }
 
-/**
- * Validate an Azure AD ID token.
- * 
- * @param {string} idToken - The ID token from Azure AD (sent by frontend)
- * @returns {object} Decoded token claims if valid
- * @throws {Error} If token is invalid, expired, or from wrong issuer/audience
- */
 async function validateAzureToken(idToken) {
-  if (!idToken) {
-    throw new Error('No token provided');
-  }
+  if (!idToken) throw new Error('No token provided');
 
-  // Decode header to get kid for JWKS lookup
   const decoded = jwt.decode(idToken, { complete: true });
-  if (!decoded || !decoded.header) {
-    throw new Error('Invalid token format');
-  }
+  if (!decoded || !decoded.header) throw new Error('Invalid token format');
 
-  // Get the public key from Azure AD JWKS
   const publicKey = await getSigningKey(decoded.header);
 
-  // Verify the token
   const claims = jwt.verify(idToken, publicKey, {
     algorithms: ['RS256'],
     audience: azureConfig.AUDIENCE,
@@ -75,184 +48,111 @@ async function validateAzureToken(idToken) {
   return claims;
 }
 
-/**
- * Find or create a user in auth_users based on Azure AD claims.
- * 
- * Flow:
- * 1. Look up by azure_oid (primary SSO identifier)
- * 2. If not found, look up by email (might exist as local-only user)
- * 3. If found by email → link azure_oid and upgrade auth_provider to 'both'
- * 4. If not found at all → auto-create new user
- * 
- * @param {object} params
- * @param {string} params.azure_oid - Azure AD Object ID
- * @param {string} params.email - User email (UPN)
- * @param {string} params.name - Display name from Azure AD
- * @param {string[]} [params.groups] - Azure AD group names (for role mapping)
- * @returns {object} User record from auth_users
- */
-async function findOrCreateSsoUser({ azure_oid, email, name, groups = [] }) {
+async function findOrCreateSsoUser({ azure_oid, email, name, groups }) {
   const knex = db.getKnex();
-  const emailLower = (email || '').toLowerCase();
 
-  // ── Step 1: Look up by azure_oid ──────────────────────────────────────
-  let user = await knex('target_setting.auth_users')
-    .where('azure_oid', azure_oid)
-    .andWhere('is_active', true)
-    .first();
+  // 1. Look up by azure_oid
+  let user = await knex('ts_auth_users').where('azure_oid', azure_oid).first();
 
   if (user) {
-    // Update last login
-    await knex('target_setting.auth_users')
-      .where('id', user.id)
-      .update({
-        last_login_at: knex.fn.now(),
-        full_name: name || user.full_name, // Update name if changed in AD
-        updated_at: knex.fn.now(),
-      });
-
-    return user;
-  }
-
-  // ── Step 2: Look up by email (link existing local user to SSO) ────────
-  if (emailLower) {
-    user = await knex('target_setting.auth_users')
-      .where(knex.raw('LOWER(email)'), emailLower)
-      .andWhere('is_active', true)
-      .first();
-
-    if (user) {
-      // Link Azure AD identity to existing local user
-      await knex('target_setting.auth_users')
-        .where('id', user.id)
-        .update({
-          azure_oid: azure_oid,
-          azure_upn: emailLower,
-          auth_provider: 'both', // Now supports both local + SSO
-          last_login_at: knex.fn.now(),
-          updated_at: knex.fn.now(),
-        });
-
-      // Re-fetch to get updated record
-      return await knex('target_setting.auth_users')
-        .where('id', user.id)
-        .first();
-    }
-  }
-
-  // ── Step 3: Auto-provision new user ───────────────────────────────────
-  const role = determineRole(emailLower, groups);
-  const employeeCode = await generateEmployeeCode(knex, role);
-  const username = emailLower.split('@')[0] || `sso_${Date.now()}`;
-
-  const [newUser] = await knex('target_setting.auth_users')
-    .insert({
-      employee_code: employeeCode,
-      username: username,
-      password_hash: null, // SSO-only, no password
-      full_name: name || username,
-      email: emailLower,
-      role: role,
-      designation: getRoleDesignation(role),
-      azure_oid: azure_oid,
-      azure_upn: emailLower,
-      auth_provider: 'azure_ad',
-      is_active: true,
-      last_login_at: knex.fn.now(),
-    })
-    .returning('*');
-
-  // ── Log auto-provisioning in audit_log ────────────────────────────────
-  try {
-    await knex('target_setting.audit_log').insert({
-      user_id: newUser.id,
-      action: 'sso_auto_provision',
-      entity_type: 'auth_users',
-      entity_id: newUser.id,
-      new_values: JSON.stringify({
-        employee_code: employeeCode,
-        email: emailLower,
-        role: role,
-        auth_provider: 'azure_ad',
-      }),
-      ip_address: '0.0.0.0',
+    await knex('ts_auth_users').where('id', user.id).update({
+      azure_upn: email,
+      last_login_at: new Date(),
     });
-  } catch (auditErr) {
-    console.error('[SSO] Audit log insert failed (non-critical):', auditErr.message);
+    return await knex('ts_auth_users').where('id', user.id).first();
   }
+
+  // 2. Look up by email — link azure_oid
+  user = await knex('ts_auth_users').where('email', email).first();
+
+  if (user) {
+    await knex('ts_auth_users').where('id', user.id).update({
+      azure_oid,
+      azure_upn: email,
+      auth_provider: 'both',
+      last_login_at: new Date(),
+    });
+
+    await knex('ts_audit_log').insert({
+      actor_code: user.employee_code,
+      actor_role: user.role,
+      action: 'sso_account_linked',
+      entity_type: 'auth_users',
+      entity_id: user.id,
+      detail: JSON.stringify({ azure_oid, email }),
+    });
+
+    return await knex('ts_auth_users').where('id', user.id).first();
+  }
+
+  // 3. Auto-provision new user
+  const role = determineRole(groups, email);
+  const employeeCode = await generateEmployeeCode(knex, role);
+
+  const [newUser] = await knex('ts_auth_users').insert({
+    employee_code: employeeCode,
+    username: email.split('@')[0],
+    full_name: name,
+    email,
+    role,
+    auth_provider: 'azure_ad',
+    azure_oid,
+    azure_upn: email,
+    is_active: true,
+    last_login_at: new Date(),
+  }).returning('*');
+
+  await knex('ts_audit_log').insert({
+    actor_code: employeeCode,
+    actor_role: role,
+    action: 'sso_user_provisioned',
+    entity_type: 'auth_users',
+    entity_id: newUser.id,
+    detail: JSON.stringify({ azure_oid, email, groups }),
+  });
 
   return newUser;
 }
 
-/**
- * Determine role for a new SSO user.
- * Priority: default admin emails → Azure AD group mapping → default role
- */
-function determineRole(email, groups = []) {
-  // 1. Check default admin emails
-  if (azureConfig.DEFAULT_ADMIN_EMAILS.includes(email)) {
-    return 'admin';
-  }
+function determineRole(groups, email) {
+  const adminEmails = (process.env.DEFAULT_ADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase());
+  if (adminEmails.includes(email.toLowerCase())) return 'admin';
 
-  // 2. Check Azure AD group → role mapping
-  for (const groupName of groups) {
-    const mappedRole = azureConfig.GROUP_ROLE_MAP[groupName];
-    if (mappedRole) {
-      return mappedRole;
+  if (groups && groups.length > 0 && azureConfig.GROUP_ROLE_MAP) {
+    for (const [groupName, role] of Object.entries(azureConfig.GROUP_ROLE_MAP)) {
+      if (groups.includes(groupName)) return role;
     }
   }
 
-  // 3. Fall back to configured default
-  return azureConfig.DEFAULT_SSO_ROLE;
+  return process.env.DEFAULT_SSO_ROLE || 'sales_rep';
 }
 
-/**
- * Generate a unique employee code based on role.
- */
 async function generateEmployeeCode(knex, role) {
   const prefixMap = {
-    sales_rep: 'SR',
-    tbm: 'TBM',
-    abm: 'ABM',
-    zbm: 'ZBM',
-    sales_head: 'SH',
-    admin: 'ADM',
+    sales_rep: 'SR', tbm: 'TBM', abm: 'ABM', zbm: 'ZBM',
+    sales_head: 'SH', admin: 'ADM',
+    at_iol_specialist: 'ATIOL', eq_spec_diagnostic: 'EQSD', eq_spec_surgical: 'EQSS',
+    at_iol_manager: 'ATIOLM', eq_mgr_diagnostic: 'EQMD', eq_mgr_surgical: 'EQMS',
   };
   const prefix = prefixMap[role] || 'EMP';
 
-  // Find the highest existing code for this prefix
-  const latest = await knex('target_setting.auth_users')
+  const lastUser = await knex('ts_auth_users')
     .where('employee_code', 'like', `${prefix}-%`)
-    .orderByRaw("CAST(SPLIT_PART(employee_code, '-', 2) AS INTEGER) DESC")
+    .orderBy('employee_code', 'desc')
     .first();
 
   let nextNum = 1;
-  if (latest) {
-    const parts = latest.employee_code.split('-');
-    const num = parseInt(parts[1], 10);
-    if (!isNaN(num)) nextNum = num + 1;
+  if (lastUser) {
+    const parts = lastUser.employee_code.split('-');
+    nextNum = parseInt(parts[parts.length - 1] || 0) + 1;
   }
 
-  return `${prefix}-${String(nextNum).padStart(3, '0')}`;
-}
-
-/**
- * Get designation label for a role.
- */
-function getRoleDesignation(role) {
-  const map = {
-    sales_rep: 'Sales Representative',
-    tbm: 'Territory Business Manager',
-    abm: 'Area Business Manager',
-    zbm: 'Zonal Business Manager',
-    sales_head: 'Sales Head',
-    admin: 'System Administrator',
-  };
-  return map[role] || role;
+  return `${prefix}-${String(nextNum).padStart(4, '0')}`;
 }
 
 module.exports = {
   validateAzureToken,
   findOrCreateSsoUser,
   determineRole,
+  generateEmployeeCode,
 };

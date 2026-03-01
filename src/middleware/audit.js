@@ -1,9 +1,13 @@
-const { db } = require('../config/database');
+/**
+ * audit.js — Audit Logging Middleware
+ * @version 2.0.0 - Migrated to aop.ts_* schema (v5)
+ */
 
+const { db } = require('../config/database');
 
 const logAudit = async ({ actorCode, actorRole, action, entityType, entityId, detail, ipAddress }) => {
   try {
-    await db('audit_log').insert({
+    await db('ts_audit_log').insert({
       actor_code: actorCode,
       actor_role: actorRole,
       action,
@@ -14,10 +18,8 @@ const logAudit = async ({ actorCode, actorRole, action, entityType, entityId, de
     });
   } catch (err) {
     console.error('Audit log write failed:', err.message);
-
   }
 };
-
 
 const auditMiddleware = (req, res, next) => {
   req.logAudit = (params) =>
